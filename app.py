@@ -127,9 +127,25 @@ def create():
 def play(name):
     state = load_state(name)
 
-    if state["stopped"] or (len(state["queue"]) + len(state["winners"]) == 1 and not state["current"]):
+    # Tournament finished naturally
+    if not state["stopped"] and not state["current"]:
+        total_remaining = len(state["queue"]) + len(state["winners"])
+        if total_remaining == 1:
+            # Commit final round if missing
+            if not state["round_history"] or state["round_history"][-1]["round"] != state["round"]:
+                final_winner = state["queue"] or state["winners"]
+                state["round_history"].append({
+                    "round": state["round"],
+                    "winners": final_winner[:]
+                })
+            save_state(name, state)
+            return redirect(f"/results/{name}")
+
+    # Manual stop
+    if state["stopped"]:
         save_state(name, state)
         return redirect(f"/results/{name}")
+
 
     if not state["current"]:
         if len(state["queue"]) >= 2:
@@ -252,7 +268,7 @@ def results(name):
 
 <div style="display:flex; flex-wrap:wrap;">
 {% for r in state.round_history %}
-  <div style="margin:10px;">
+  <div style="margin:10px; width:100%;">
     <h3>Round {{r.round}}</h3>
     {% for img in r.winners %}
       <a href="/image/{{name}}/{{img}}" target="_blank">
