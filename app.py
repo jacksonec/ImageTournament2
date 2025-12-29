@@ -1,322 +1,244 @@
-import os, json, random, math, io, zipfile, shutil
-from flask import (
-    Flask, render_template_string, request, redirect,
-    send_from_directory, send_file
-)
-from werkzeug.utils import secure_filename
-
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-BRACKETS_DIR = os.path.join(BASE_DIR, "brackets")
-os.makedirs(BRACKETS_DIR, exist_ok=True)
+import random
+import re
+import requests
+from flask import Flask, render_template_string, redirect, request
 
 app = Flask(__name__)
 
+PHOTOPRISM_URL = "http://beckimemory.jackson.terf/api/v1"
+USERNAME = "admin"
+APP_PASSWORD = "SOth134!#$"
+
+ROUND_SUFFIX_RE = re.compile(r"\s+-\s+Round\s+\d+\s+Winners$")
+
+
+def base_album_title(title: str) -> str:
+    return ROUND_SUFFIX_RE.sub("", title)
+
+
 # -------------------------------------------------
-# Helpers
+# PhotoPrism Helpers
 # -------------------------------------------------
 
-def bracket_path(name):
-    return os.path.join(BRACKETS_DIR, name)
+def get_session():
+    resp = requests.post(
+        f"{PHOTOPRISM_URL}/session",
+        json={"username": USERNAME, "password": APP_PASSWORD},
+        headers={"Content-Type": "application/json"},
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data["access_token"], data["config"]["downloadToken"]
 
-def images_path(name):
-    return os.path.join(bracket_path(name), "images")
 
-def state_path(name):
-    return os.path.join(bracket_path(name), "state.json")
+def list_albums():
+    token, _ = get_session()
+    r = requests.get(
+        f"{PHOTOPRISM_URL}/albums",
+        headers={"X-Auth-Token": token},
+        params={"count": 200, "order": "name", "include": "metadata", "type": "album"},
+    )
+    r.raise_for_status()
+    return sorted(r.json(), key=lambda a: a["Title"])
 
-def init_state(image_dir):
-    images = [
-        f for f in os.listdir(image_dir)
-        if f.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif"))
-    ]
-    random.shuffle(images)
-    n = len(images)
-    return {
-        "round": 1,
-        "total_rounds": math.ceil(math.log2(n)) if n > 1 else 1,
-        "queue": images,
-        "winners": [],
-        "current": [],
-        "ranking": [],
-        "round_history": [],
-        "stopped": False
-    }
 
-def load_state(name):
-    with open(state_path(name)) as f:
-        return json.load(f)
+def get_photos(album_uid):
+    token, _ = get_session()
+    r = requests.get(
+        f"{PHOTOPRISM_URL}/photos",
+        headers={"X-Auth-Token": token},
+        params={"count": 5000, "s": album_uid},
+    )
+    r.raise_for_status()
+    return r.json()
 
-def save_state(name, state):
-    with open(state_path(name), "w") as f:
-        json.dump(state, f, indent=2)
+
+def create_album(title):
+    token, _ = get_session()
+    r = requests.post(
+        f"{PHOTOPRISM_URL}/albums",
+        headers={"X-Auth-Token": token},
+        json={"Title": title},
+    )
+    r.raise_for_status()
+    return r.json()["UID"]
+
+
+def add_photos_to_album(album_uid, photo_uids):
+    token, _ = get_session()
+    for uid in photo_uids:
+        r = requests.post(
+            f"{PHOTOPRISM_URL}/albums/{album_uid}/photos",
+            headers={"X-Auth-Token": token},
+            json={"photos": [uid]},
+        )
+        r.raise_for_status()
+
 
 # -------------------------------------------------
 # Main Menu
 # -------------------------------------------------
 
 @app.route("/")
-def menu():
-    brackets = sorted(
-        d for d in os.listdir(BRACKETS_DIR)
-        if os.path.isdir(bracket_path(d))
-    )
+def index():
+    albums = list_albums()
     return render_template_string("""
-<h1>Image Tournament</h1>
-
-<a href="/new"><button>New Bracket</button></a>
-
-<h2>Completed Brackets</h2>
+<h1>PhotoPrism Image Tournament</h1>
 <ul>
-{% for b in brackets %}
+{% for a in albums %}
   <li>
-    <a href="/results/{{b}}">{{b}}</a>
-    <form action="/delete/{{b}}" method="post" style="display:inline;">
-      <button onclick="return confirm('Delete {{b}}?')">Delete</button>
-    </form>
+    {{ a.Title }}
+    <a href="/tourney/{{ a.UID }}"><button>Image Tournament</button></a>
   </li>
 {% endfor %}
 </ul>
-""", brackets=brackets)
+""", albums=albums)
+
 
 # -------------------------------------------------
-# New Bracket
+# Tournament Route
 # -------------------------------------------------
 
-@app.route("/new")
-def new_bracket():
-    return render_template_string("""
-<h1>New Bracket</h1>
+@app.route("/tourney/<album_uid>", methods=["GET", "POST"])
+def tourney(album_uid):
+    access_token, download_token = get_session()
 
-<form action="/create" method="post" enctype="multipart/form-data">
-  <label>Bracket name:</label><br>
-  <input name="name" required><br><br>
-
-  <label>Add images:</label><br>
-  <input type="file" name="files" multiple accept="image/*"><br><br>
-
-  <button type="submit">Go</button>
-</form>
-
-<a href="/">Cancel</a>
-""")
-
-@app.route("/create", methods=["POST"])
-def create():
-    name = secure_filename(request.form["name"])
-    path = bracket_path(name)
-
-    if os.path.exists(path):
-        return "Bracket already exists", 400
-
-    os.makedirs(images_path(name), exist_ok=True)
-
-    for f in request.files.getlist("files"):
-        if f.filename:
-            f.save(os.path.join(images_path(name), secure_filename(f.filename)))
-
-    state = init_state(images_path(name))
-    save_state(name, state)
-
-    return redirect(f"/play/{name}")
-
-# -------------------------------------------------
-# Tournament Play (FULL SCREEN PICKER)
-# -------------------------------------------------
-
-@app.route("/play/<name>")
-def play(name):
-    state = load_state(name)
-
-    # Tournament finished naturally
-    if not state["stopped"] and not state["current"]:
-        total_remaining = len(state["queue"]) + len(state["winners"])
-        if total_remaining == 1:
-            # Commit final round if missing
-            if not state["round_history"] or state["round_history"][-1]["round"] != state["round"]:
-                final_winner = state["queue"] or state["winners"]
-                state["round_history"].append({
-                    "round": state["round"],
-                    "winners": final_winner[:]
-                })
-            save_state(name, state)
-            return redirect(f"/results/{name}")
-
-    # Manual stop
-    if state["stopped"]:
-        save_state(name, state)
-        return redirect(f"/results/{name}")
-
-
-    if not state["current"]:
-        if len(state["queue"]) >= 2:
-            state["current"] = state["queue"][:2]
-            state["queue"] = state["queue"][2:]
-        elif len(state["queue"]) == 1:
-            state["winners"].append(state["queue"].pop())
-        else:
-            if len(state["winners"]) > 1:
-                state["round_history"].append({
-                    "round": state["round"],
-                    "winners": state["winners"][:]
-                })
-                state["queue"] = state["winners"]
-                random.shuffle(state["queue"])
-                state["winners"] = []
-                state["round"] += 1
-            else:
-                state["queue"] = state["winners"]
-                state["winners"] = []
-
-        save_state(name, state)
-        return redirect(f"/play/{name}")
-
-    left, right = state["current"]
-    remaining = len(state["queue"]) + len(state["winners"]) + 2
-
-    return render_template_string("""
-<!doctype html>
-<html>
-<head>
-<title>Image Tournament</title>
-<style>
-body {
-  margin: 0;
-  height: 100vh;
-  display: flex;
-  flex-direction: column;
-}
-
-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 8px 12px;
-  background: #111;
-  color: white;
-}
-
-form.images {
-  flex: 1;
-  display: flex;
-}
-
-button.pick {
-  flex: 1;
-  border: none;
-  background: black;
-  padding: 0;
-}
-
-button.pick img {
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-}
-</style>
-</head>
-<body>
-
-<header>
-  <div>Round {{r}} of {{tr}} — {{rem}} remaining</div>
-  <form action="/stop/{{name}}" method="post">
-    <button>Stop</button>
-  </form>
-</header>
-
-<form class="images" method="post">
-  <button class="pick" name="winner" value="{{left}}">
-    <img src="/image/{{name}}/{{left}}">
-  </button>
-  <button class="pick" name="winner" value="{{right}}">
-    <img src="/image/{{name}}/{{right}}">
-  </button>
-</form>
-
-</body>
-</html>
-""", left=left, right=right, r=state["round"],
-   tr=state["total_rounds"], rem=remaining, name=name)
-
-@app.route("/play/<name>", methods=["POST"])
-def vote(name):
-    state = load_state(name)
-    left, right = state["current"]
-    winner = request.form["winner"]
-    loser = right if winner == left else left
-    state["winners"].append(winner)
-    state["ranking"].insert(0, loser)
-    state["current"] = []
-    save_state(name, state)
-    return redirect(f"/play/{name}")
-
-@app.route("/stop/<name>", methods=["POST"])
-def stop(name):
-    state = load_state(name)
-    state["stopped"] = True
-    save_state(name, state)
-    return redirect(f"/results/{name}")
-
-# -------------------------------------------------
-# Results
-# -------------------------------------------------
-
-@app.route("/results/<name>")
-def results(name):
-    state = load_state(name)
-    return render_template_string("""
-<h1>Results: {{name}}</h1>
-
-<div style="display:flex; flex-wrap:wrap;">
-{% for r in state.round_history %}
-  <div style="margin:10px; width:100%;">
-    <h3>Round {{r.round}}</h3>
-    {% for img in r.winners %}
-      <a href="/image/{{name}}/{{img}}" target="_blank">
-        <img src="/image/{{name}}/{{img}}" width="120">
-      </a>
-    {% endfor %}
-    <form action="/download/{{name}}/{{r.round}}">
-      <button>Download</button>
-    </form>
-  </div>
-{% endfor %}
-</div>
-
-<a href="/"><button>Exit</button></a>
-""", state=state, name=name)
-
-# -------------------------------------------------
-# Downloads / Images / Delete
-# -------------------------------------------------
-
-@app.route("/download/<name>/<int:round>")
-def download(name, round):
-    state = load_state(name)
-    winners = state["round_history"][round - 1]["winners"]
-
-    mem = io.BytesIO()
-    with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as z:
-        for f in winners:
-            root, ext = os.path.splitext(f)
-            renamed = f"{root}-round{round}{ext}"
-            z.write(os.path.join(images_path(name), f), renamed)
-
-    mem.seek(0)
-    return send_file(
-        mem,
-        download_name=f"{name}_round_{round}.zip",
-        as_attachment=True
+    # Album info
+    r = requests.get(
+        f"{PHOTOPRISM_URL}/albums/{album_uid}",
+        headers={"X-Auth-Token": access_token},
     )
+    r.raise_for_status()
+    album = r.json()
+    album_title = album["Title"]
 
-@app.route("/image/<name>/<file>")
-def image(name, file):
-    return send_from_directory(images_path(name), file)
+    # Photos (deduplicated)
+    photos = get_photos(album_uid)
+    photos_by_uid = {p["UID"]: p for p in photos}
+    photo_list = list(photos_by_uid.values())
 
-@app.route("/delete/<name>", methods=["POST"])
-def delete(name):
-    shutil.rmtree(bracket_path(name), ignore_errors=True)
-    return redirect("/")
+    random.shuffle(photo_list)
 
+    # Remove odd image (no byes)
+    if len(photo_list) % 2 == 1:
+        photo_list = photo_list[:-1]
+
+    total = len(photo_list)
+
+    if total < 2:
+        return "<h1>Not enough images to run a tournament.</h1><a href='/'>Back</a>"
+
+    # State
+    index = int(request.form.get("index", 0))
+    winners = request.form.getlist("winners")
+    round_num = int(request.args.get("round", 1))
+
+    # STOP BUTTON HANDLER
+    if request.method == "POST" and request.form.get("stop") == "1":
+        if winners:
+            base_title = base_album_title(album_title)
+            new_title = f"{base_title} - Round {round_num} Winners"
+            new_album_uid = create_album(new_title)
+            add_photos_to_album(new_album_uid, winners)
+        return redirect("/")
+
+    # Winner submission
+    if request.method == "POST" and "winner" in request.form:
+        winners.append(request.form["winner"])
+        index += 2
+
+        if index >= total:
+            # Round complete
+            base_title = base_album_title(album_title)
+            new_title = f"{base_title} - Round {round_num} Winners"
+            new_album_uid = create_album(new_title)
+            add_photos_to_album(new_album_uid, winners)
+
+            return redirect(f"/tourney/{new_album_uid}?round={round_num + 1}")
+
+    # Matchup
+    left = photo_list[index]
+    right = photo_list[index + 1]
+
+    match_num = (index // 2) + 1
+    total_matches = total // 2
+
+    left_url = f"{PHOTOPRISM_URL}/dl/{left['Hash']}?t={download_token}"
+    right_url = f"{PHOTOPRISM_URL}/dl/{right['Hash']}?t={download_token}"
+
+    return render_template_string("""
+    <style>
+      .matchup {
+        display: flex;
+        gap: 20px;
+        justify-content: center;
+        align-items: center;
+        height: 85vh;
+      }
+
+      .matchup a {
+        flex: 1;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+      }
+
+      .matchup img {
+        max-width: 100%;
+        max-height: 85vh;
+        object-fit: contain;
+        cursor: pointer;
+      }
+    </style>
+
+    <h1>{{ album_title }}</h1>
+    <h3>Round {{ round_num }} — Match {{ match_num }} of {{ total_matches }}</h3>
+
+    <form method="post" style="margin-bottom:20px;">
+      <input type="hidden" name="stop" value="1">
+      <input type="hidden" name="index" value="{{ index }}">
+      {% for w in winners %}
+        <input type="hidden" name="winners" value="{{ w }}">
+      {% endfor %}
+      <button style="background:#c33;color:white;padding:10px 20px;font-size:16px;">
+        Stop & Save Round
+      </button>
+    </form>
+
+    <form method="post">
+      <input type="hidden" name="index" value="{{ index }}">
+      {% for w in winners %}
+        <input type="hidden" name="winners" value="{{ w }}">
+      {% endfor %}
+
+      <div class="matchup">
+        <a href="#" onclick="this.closest('form').winner.value='{{ left.UID }}'; this.closest('form').submit(); return false;">
+          <img src="{{ left_url }}">
+        </a>
+
+        <a href="#" onclick="this.closest('form').winner.value='{{ right.UID }}'; this.closest('form').submit(); return false;">
+          <img src="{{ right_url }}">
+        </a>
+      </div>
+
+      <input type="hidden" name="winner" value="">
+    </form>
+    """,
+                                  album_title=album_title,
+                                  round_num=round_num,
+                                  match_num=match_num,
+                                  total_matches=total_matches,
+                                  index=index,
+                                  winners=winners,
+                                  left=left,
+                                  right=right,
+                                  left_url=left_url,
+                                  right_url=right_url,
+                                  )
+
+
+# -------------------------------------------------
+# Run App
 # -------------------------------------------------
 
 if __name__ == "__main__":
