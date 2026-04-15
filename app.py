@@ -74,15 +74,36 @@ def add_photos_to_album(album_uid, photo_uids):
         )
         r.raise_for_status()
 
+def bulk_create_albums_logic(titles_string):
+    token, _ = get_session()
+    titles = [t.strip() for t in titles_string.split('\n') if t.strip()]
+    results = []
+    for title in titles:
+        try:
+            r = requests.post(
+                f"{PHOTOPRISM_URL}/albums",
+                headers={"X-Auth-Token": token},
+                json={"Title": title},
+            )
+            r.raise_for_status()
+            results.append(f"Created: {title}")
+        except Exception as e:
+            results.append(f"Error creating '{title}': {str(e)}")
+    return results
+
 
 # -------------------------------------------------
-# Main Menu
+# Routes
 # -------------------------------------------------
 
 @app.route("/")
 def index():
     albums = list_albums()
     return render_template_string("""
+<nav style="margin-bottom: 20px; padding: 10px; background: #eee;">
+    <strong>Navigation:</strong> 
+    <a href="/bulk-albums">Bulk Album Creator</a>
+</nav>
 <h1>PhotoPrism Image Tournament</h1>
 <ul>
 {% for a in albums %}
@@ -95,9 +116,37 @@ def index():
 """, albums=albums)
 
 
-# -------------------------------------------------
-# Tournament Route
-# -------------------------------------------------
+@app.route("/bulk-albums", methods=["GET", "POST"])
+def bulk_albums():
+    logs = []
+    if request.method == "POST":
+        album_blob = request.form.get("album_list", "")
+        if album_blob:
+            logs = bulk_create_albums_logic(album_blob)
+
+    return render_template_string("""
+<nav style="margin-bottom: 20px; padding: 10px; background: #eee;">
+    <strong>Navigation:</strong> 
+    <a href="/">Back to Tournament List</a>
+</nav>
+<h1>Bulk Create Albums</h1>
+<p>Paste album names (one per line):</p>
+<form method="post">
+    <textarea name="album_list" style="width:100%; height:300px;" placeholder="Album Name 1&#10;Album Name 2"></textarea>
+    <br><br>
+    <button type="submit" style="padding:10px 20px; cursor:pointer;">Create All Albums</button>
+</form>
+
+{% if logs %}
+<div style="margin-top:20px; border:1px solid #ccc; padding:10px; font-family:monospace;">
+    <h3>Results:</h3>
+    {% for log in logs %}
+        <div style="color: {{ 'red' if 'Error' in log else 'green' }}">{{ log }}</div>
+    {% endfor %}
+</div>
+{% endif %}
+""", logs=logs)
+
 
 @app.route("/tourney/<album_uid>", methods=["GET", "POST"])
 def tourney(album_uid):
@@ -114,33 +163,20 @@ def tourney(album_uid):
 
     round_num = int(request.args.get("round", 1))
 
-    # -------------------------------------------------
-    # INITIAL ROUND SETUP (GET only)
-    # -------------------------------------------------
     if request.method == "GET":
         photos = get_photos(album_uid)
         photos_by_uid = {p["UID"]: p for p in photos}
         remaining = list(photos_by_uid.keys())
-
         random.shuffle(remaining)
-
-        # No byes
         if len(remaining) % 2 == 1:
             remaining = remaining[:-1]
-
         if len(remaining) < 2:
             return "<h1>Not enough images.</h1><a href='/'>Back</a>"
-
         winners = []
-
-    # -------------------------------------------------
-    # POST — state carried forward
-    # -------------------------------------------------
     else:
         remaining = request.form.getlist("remaining")
         winners = request.form.getlist("winners")
 
-        # STOP BUTTON
         if request.form.get("stop") == "1":
             if winners:
                 base_title = base_album_title(album_title)
@@ -149,17 +185,12 @@ def tourney(album_uid):
                 add_photos_to_album(new_album_uid, winners)
             return redirect("/")
 
-        # Winner chosen
         winner = request.form.get("winner")
         left = request.form.get("left")
         right = request.form.get("right")
-
         winners.append(winner)
-
-        # Remove both competitors
         remaining = [r for r in remaining if r not in (left, right)]
 
-        # Round complete
         if not remaining:
             base_title = base_album_title(album_title)
             new_title = f"{base_title} - Round {round_num} Winners"
@@ -167,14 +198,9 @@ def tourney(album_uid):
             add_photos_to_album(new_album_uid, winners)
             return redirect(f"/tourney/{new_album_uid}?round={round_num + 1}")
 
-    # -------------------------------------------------
-    # Current matchup
-    # -------------------------------------------------
     left_uid, right_uid = remaining[0], remaining[1]
-
     photos = get_photos(album_uid)
     photo_map = {p["UID"]: p for p in photos}
-
     left = photo_map[left_uid]
     right = photo_map[right_uid]
 
@@ -186,55 +212,30 @@ def tourney(album_uid):
 
     return render_template_string("""
 <style>
-.matchup {
-  display: flex;
-  gap: 20px;
-  justify-content: center;
-  align-items: center;
-  height: 85vh;
-}
-.matchup a {
-  flex: 1;
-  display: flex;
-  justify-content: center;
-  align-items: center;
-}
-.matchup img {
-  max-width: 100%;
-  max-height: 85vh;
-  object-fit: contain;
-  cursor: pointer;
-}
+.matchup { display: flex; gap: 20px; justify-content: center; align-items: center; height: 85vh; }
+.matchup a { flex: 1; display: flex; justify-content: center; align-items: center; }
+.matchup img { max-width: 100%; max-height: 85vh; object-fit: contain; cursor: pointer; }
 </style>
+<nav style="padding: 10px; background: #eee;">
+    <a href="/">← Exit Tournament</a> | <a href="/bulk-albums">Bulk Album Creator</a>
+</nav>
 
 <h1>{{ album_title }}</h1>
 <h3>Round {{ round_num }} — Match {{ match_num }} of {{ total_matches }}</h3>
 
 <form method="post" style="margin-bottom:20px;">
   <input type="hidden" name="stop" value="1">
-  {% for r in remaining %}
-    <input type="hidden" name="remaining" value="{{ r }}">
-  {% endfor %}
-  {% for w in winners %}
-    <input type="hidden" name="winners" value="{{ w }}">
-  {% endfor %}
-  <button style="background:#c33;color:white;padding:10px 20px;font-size:16px;">
-    Stop & Save Round
-  </button>
+  {% for r in remaining %}<input type="hidden" name="remaining" value="{{ r }}">{% endfor %}
+  {% for w in winners %}<input type="hidden" name="winners" value="{{ w }}">{% endfor %}
+  <button style="background:#c33;color:white;padding:10px 20px;font-size:16px;">Stop & Save Round</button>
 </form>
 
 <form method="post">
-  {% for r in remaining %}
-    <input type="hidden" name="remaining" value="{{ r }}">
-  {% endfor %}
-  {% for w in winners %}
-    <input type="hidden" name="winners" value="{{ w }}">
-  {% endfor %}
-
+  {% for r in remaining %}<input type="hidden" name="remaining" value="{{ r }}">{% endfor %}
+  {% for w in winners %}<input type="hidden" name="winners" value="{{ w }}">{% endfor %}
   <input type="hidden" name="left" value="{{ left.UID }}">
   <input type="hidden" name="right" value="{{ right.UID }}">
   <input type="hidden" name="winner" value="">
-
   <div class="matchup">
     <a href="#" onclick="this.closest('form').winner.value='{{ left.UID }}'; this.closest('form').submit(); return false;">
       <img src="{{ left_url }}">
@@ -256,11 +257,6 @@ def tourney(album_uid):
         left_url=left_url,
         right_url=right_url,
     )
-
-
-# -------------------------------------------------
-# Run App
-# -------------------------------------------------
 
 if __name__ == "__main__":
     app.run(debug=True)
