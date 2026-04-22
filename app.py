@@ -53,12 +53,16 @@ def get_photos(album_uid):
     return r.json()
 
 
-def create_album(title):
+def create_album(title, thumb_uid=None):
     token, _ = get_session()
+    payload = {"Title": title}
+    if thumb_uid:
+        payload["Thumb"] = thumb_uid
+        
     r = requests.post(
         f"{PHOTOPRISM_URL}/albums",
         headers={"X-Auth-Token": token},
-        json={"Title": title},
+        json=payload,
     )
     r.raise_for_status()
     return r.json()["UID"]
@@ -181,7 +185,11 @@ def tourney(album_uid):
             if winners:
                 base_title = base_album_title(album_title)
                 new_title = f"{base_title} - Round {round_num} Winners"
-                new_album_uid = create_album(new_title)
+                
+                # Get the thumb from the original album
+                original_thumb = album.get("Thumb") 
+                new_album_uid = create_album(new_title, thumb_uid=original_thumb)
+                
                 add_photos_to_album(new_album_uid, winners)
             return redirect("/")
 
@@ -194,7 +202,11 @@ def tourney(album_uid):
         if not remaining:
             base_title = base_album_title(album_title)
             new_title = f"{base_title} - Round {round_num} Winners"
-            new_album_uid = create_album(new_title)
+            
+            # Get the thumb from the original album
+            original_thumb = album.get("Thumb")
+            new_album_uid = create_album(new_title, thumb_uid=original_thumb)
+            
             add_photos_to_album(new_album_uid, winners)
             return redirect(f"/tourney/{new_album_uid}?round={round_num + 1}")
 
